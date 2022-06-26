@@ -31,6 +31,7 @@ import matplotlib.pyplot as plt
 import numba
 from numba_progress import ProgressBar
 from tqdm import trange
+from pathlib import Path
 
 
 class Harmonics(object):
@@ -102,6 +103,7 @@ class Harmonics(object):
                 tr.data = np.fft.fftshift(tr.data)
             for tr in transvRF:
                 tr.data = np.fft.fftshift(tr.data)
+                
 
         self.radialRF = radialRF
         self.transvRF = transvRF
@@ -159,7 +161,7 @@ class Harmonics(object):
         # Copy stream stats
         str_stats = self.radialRF[0].stats
 
-        if use_numba == False:
+        if not use_numba:
             # Initialize work arrays
             C0 = np.zeros((nz, naz))
             C1 = np.zeros((nz, naz))
@@ -227,11 +229,16 @@ class Harmonics(object):
             C3var = np.sqrt(np.mean(np.square(C3[indmin:indmax, indaz])))
             C4var = np.sqrt(np.mean(np.square(C4[indmin:indmax, indaz])))
 
-        elif use_numba == True:
+        elif use_numba:
+            # handler for sigint (ctrl+c) when running numba
+            global ctrl_c
+            ctrl_c = import_numba_ctrl_c()
+
             # convert stream objects to numpy array
             baz_arr = np.array([trace0.stats.baz for trace0 in self.radialRF])
             radialRF_arr = np.array([trace0.data for trace0 in self.radialRF])
             transvRF_arr = np.array([trace0.data for trace0 in self.transvRF])
+
             # run calculation using numba
             with ProgressBar(total=len(self.radialRF[0].data), ascii=" #") as progress:
                 C0,C1,C2,C3,C4,C0var,C1var,C2var,C3var,C4var,indaz = \
@@ -325,8 +332,13 @@ class Harmonics(object):
         C3 = np.zeros((nz, naz))
         C4 = np.zeros((nz, naz))
 
+        global ctrl_c
+        ctrl_c.Init()
+
         # Loop over each depth step
         for iz in range(nz):
+            
+            assert not ctrl_c.Interrupted(), 'Processing stopped!'
 
             # Build matrices OBS and H for each azimuth
             for iaz in range(naz):
@@ -650,3 +662,75 @@ class Harmonics(object):
         output = open(file, 'wb')
         pickle.dump(self, output)
         output.close()
+
+
+def import_numba_ctrl_c():
+    """
+        Function to handle ctrl+c / sigint when using ``numba``
+        written in C with bridging from ``cffi``
+        reference: https://github.com/numba/numba/issues/5551
+    """
+    def mod_compile():
+        import cffi
+        ffi = cffi.FFI()
+        ffi.set_source('_numba_ctrl_c', """
+            #include <stdio.h>
+            
+            static int g_interrupted = 0;
+        
+            #if 0 && defined(_WIN32)
+                // Windows version
+                
+                #include <windows.h>    
+
+                static BOOL WINAPI CtrlHandler(DWORD fdwCtrlType)
+                {
+                    // https://docs.microsoft.com/en-us/windows/console/registering-a-control-handler-function
+                    switch (fdwCtrlType)
+                    {
+                        case CTRL_C_EVENT:
+                            g_interrupted = 1;
+                            return TRUE;
+                        default:
+                            return FALSE;
+                    }
+                }
+
+                int Init() {
+                    return SetConsoleCtrlHandler(CtrlHandler, TRUE);
+                }
+            #else
+                // Linux version and Actually any OS version
+                
+                #include <signal.h>
+                
+                void CtrlHandler(int sig) {
+                    g_interrupted = 1;
+                }
+                
+                int Init() {
+                    signal(SIGINT, CtrlHandler);
+                    return 1;
+                }
+            #endif
+            
+            int Interrupted() {
+                return g_interrupted;
+            }
+        """)
+        ffi.cdef("""
+            int Init();
+            int Interrupted();
+        """)
+        path = Path(__file__).parent.absolute()
+        ffi.compile(path)
+    try:
+        import rfpy._numba_ctrl_c as _numba_ctrl_c
+    except Exception:
+        mod_compile()
+        import rfpy._numba_ctrl_c as _numba_ctrl_c
+    import numba.core.typing.cffi_utils as cffi_support
+    cffi_support.register_module(_numba_ctrl_c)
+    return _numba_ctrl_c.lib
+
+
